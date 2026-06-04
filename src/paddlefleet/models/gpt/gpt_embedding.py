@@ -13,6 +13,7 @@
 # limitations under the License.
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal
 
@@ -219,7 +220,6 @@ class GPTEmbedding(FleetLayer):
                 inputs_embeds = decoder_input[
                     :, : -self.config.num_nextn_predict_layers, :
                 ]
-                inputs_embeds_ori = inputs_embeds
                 batch_size, seq_length, hidden_size = inputs_embeds.shape
 
                 if (
@@ -255,13 +255,37 @@ class GPTEmbedding(FleetLayer):
                         input_ids=pad_input_ids,
                         position_ids=pad_position_ids,
                     )
-                    inputs_embeds_mtp = paddle.concat(
-                        [
-                            inputs_embeds_ori[:, (depth + 1) :, :],
-                            pad_embeds,
-                        ],
-                        axis=1,
-                    )
+                    if (
+                        paddle.core._has_grad()
+                        and os.getenv("DSV4_FLEET_MTP_SEPARATE_EMBEDDING", "0")
+                        == "1"
+                    ):
+                        shifted_input_ids = input_ids[
+                            :, (depth + 1) : seq_length
+                        ]
+                        shifted_position_ids = None
+                        if (
+                            not self.multimodal_embedding
+                            and position_ids is not None
+                        ):
+                            shifted_position_ids = position_ids[
+                                :, (depth + 1) : seq_length
+                            ]
+                        shifted_embeds = self.embedding(
+                            input_ids=shifted_input_ids,
+                            position_ids=shifted_position_ids,
+                        )
+                        inputs_embeds_mtp = paddle.concat(
+                            [shifted_embeds, pad_embeds], axis=1
+                        )
+                    else:
+                        inputs_embeds_mtp = paddle.concat(
+                            [
+                                inputs_embeds[:, (depth + 1) :, :],
+                                pad_embeds,
+                            ],
+                            axis=1,
+                        )
 
                     if (
                         get_context_parallel_world_size() > 1
