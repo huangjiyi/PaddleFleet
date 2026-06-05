@@ -77,6 +77,85 @@ _MODEL_PARALLEL_ATTRIBUTE_DEFAULTS = {
 }
 
 
+def _dsv4_te_dgrad_enabled(
+    grad_output: paddle.Tensor, weight: paddle.Tensor
+) -> bool:
+    if os.getenv("DSV4_FLEET_TE_DGRAD", "0") != "1":
+        return False
+    shape_filter = os.getenv("DSV4_FLEET_TE_DGRAD_WEIGHT_SHAPES", "")
+    if shape_filter:
+        allowed = {
+            item.strip() for item in shape_filter.split(",") if item.strip()
+        }
+        if "x".join(str(dim) for dim in weight.shape) not in allowed:
+            return False
+    out_filter = os.getenv("DSV4_FLEET_TE_DGRAD_OUT_FEATURES", "")
+    if out_filter:
+        allowed_out = {
+            item.strip() for item in out_filter.split(",") if item.strip()
+        }
+        if str(grad_output.shape[-1]) not in allowed_out:
+            return False
+    return weight.dtype == paddle.bfloat16 and grad_output.dtype == paddle.bfloat16
+
+
+def _dsv4_te_dgrad(
+    grad_output: paddle.Tensor, weight: paddle.Tensor
+) -> paddle.Tensor:
+    import hashlib
+    import sys
+
+    te_site_packages = os.getenv("DSV4_FLEET_TE_SITE_PACKAGES", "")
+    if te_site_packages and te_site_packages not in sys.path:
+        sys.path.insert(0, te_site_packages)
+
+    import torch
+    import torch.utils.dlpack
+    from paddle.utils import dlpack as paddle_dlpack
+    from transformer_engine.pytorch.cpp_extensions.gemm import general_gemm
+
+    grad_output_torch = torch.utils.dlpack.from_dlpack(
+        paddle_dlpack.to_dlpack(grad_output.contiguous())
+    )
+    weight_oi_torch = torch.utils.dlpack.from_dlpack(
+        paddle_dlpack.to_dlpack(weight.t().contiguous())
+    )
+    grad_input_torch, *_ = general_gemm(
+        weight_oi_torch,
+        grad_output_torch,
+        out_dtype=torch.bfloat16,
+        layout="NN",
+        grad=True,
+    )
+
+    if os.getenv("DSV4_FLEET_TE_DGRAD_LOG", "0") == "1":
+        rank = paddle.distributed.get_rank() if dist.is_initialized() else 0
+        rank_filter = os.getenv("DSV4_FLEET_TE_DGRAD_LOG_RANKS", "0")
+        allowed_ranks = {x.strip() for x in rank_filter.split(",")}
+        if rank_filter == "all" or str(rank) in allowed_ranks:
+            grad32 = grad_input_torch.detach().float()
+            flat = grad32.reshape(-1)
+            max_numel = int(
+                os.getenv("DSV4_FLEET_TE_DGRAD_LOG_MAX_NUMEL", "600000000")
+            )
+            count = min(flat.numel(), max_numel)
+            md5 = hashlib.md5(
+                flat[:count].cpu().numpy().tobytes()
+            ).hexdigest()
+            print(
+                "[DSV4_FLEET_TE_DGRAD] "
+                f"rank={rank} grad_output_shape={tuple(grad_output.shape)} "
+                f"weight_shape={tuple(weight.shape)} "
+                f"grad_input_shape={tuple(grad_input_torch.shape)} "
+                f"norm={grad32.norm().item():.12f} md5_first_{count}={md5}",
+                flush=True,
+            )
+
+    return paddle_dlpack.from_dlpack(
+        torch.utils.dlpack.to_dlpack(grad_input_torch.contiguous())
+    )
+
+
 def param_is_not_tensor_parallel_duplicate(param):
     """Returns true if the passed-in parameter is not a duplicate parameter
     on another TP rank."""
@@ -357,7 +436,10 @@ class LinearWithFrozenWeight(paddle.autograd.Function):
     def backward(ctx, grad_output):
         """Backward with frozen weight."""
         (weight, bias) = ctx.saved_tensor()
-        grad_input = grad_output.matmul(weight.t())
+        if _dsv4_te_dgrad_enabled(grad_output, weight):
+            grad_input = _dsv4_te_dgrad(grad_output, weight)
+        else:
+            grad_input = grad_output.matmul(weight.t())
 
         if ctx.allreduce_dgrad:
             # All-reduce. Note: here async and sync are effectively the same.
@@ -546,7 +628,10 @@ class LinearWithGradAccumulationAndAsyncCommunication(paddle.autograd.Function):
                 total_input = all_gather_buffer
             else:
                 total_input = input
-        grad_input = grad_output.matmul(weight.t())
+        if _dsv4_te_dgrad_enabled(grad_output, weight):
+            grad_input = _dsv4_te_dgrad(grad_output, weight)
+        else:
+            grad_input = grad_output.matmul(weight.t())
 
         if ctx.sequence_parallel and wgrad_compute:
             # pylint: disable=possibly-used-before-assignment
